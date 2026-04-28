@@ -47,6 +47,8 @@ class TaskRecord:
     created_monotonic: float
     status: str = "queued"
     assigned_agent_id: Optional[str] = None
+    started_monotonic: Optional[float] = None
+    completed_monotonic: Optional[float] = None
     result: Optional[Dict[str, Any]] = None
     labels: Set[str] = field(default_factory=set)
-
+    dependencies: List[str] = field(default_factory=list)

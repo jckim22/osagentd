@@ -81,6 +81,10 @@ def build_parser() -> argparse.ArgumentParser:
     cancel = sub.add_parser("cancel-task")
     cancel.add_argument("--task-id", required=True)
 
+    retry = sub.add_parser("retry-run")
+    retry.add_argument("--run-id", required=True)
+    retry.add_argument("--include-completed", action="store_true")
+
     acquire = sub.add_parser("acquire")
     acquire.add_argument("--agent-id", required=True)
     acquire.add_argument("--resources", required=True)
@@ -144,6 +148,12 @@ def payload_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         }
     if args.command == "cancel-task":
         return {"action": "cancel_task", "task_id": args.task_id}
+    if args.command == "retry-run":
+        return {
+            "action": "retry_run",
+            "run_id": args.run_id,
+            "include_completed": args.include_completed,
+        }
     if args.command == "acquire":
         return {
             "action": "acquire",
@@ -173,4 +183,3 @@ def main(argv: Iterable[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

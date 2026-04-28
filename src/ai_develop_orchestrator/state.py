@@ -80,6 +80,7 @@ class OrchestratorState:
         required_resources: Iterable[str],
         lease_ttl_ms: int,
         labels: Iterable[str],
+        dependencies: Iterable[str] = (),
     ) -> TaskRecord:
         task = TaskRecord(
             task_id=str(uuid.uuid4()),
@@ -91,6 +92,7 @@ class OrchestratorState:
             lease_ttl_ms=max(1000, lease_ttl_ms),
             created_monotonic=self.now(),
             labels={label for label in labels if label},
+            dependencies=[dep for dep in dependencies if dep],
         )
         self.tasks[task.task_id] = task
         self._enqueue_task(task.task_id)
@@ -106,10 +108,13 @@ class OrchestratorState:
             task = self.tasks.get(task_id)
             if not task or task.status != "queued":
                 continue
+            if not self._dependencies_satisfied(task):
+                continue
             if task.required_capabilities and not task.required_capabilities.issubset(advertised):
                 continue
             if not self._can_grant(task.required_resources):
                 continue
+            self._inject_dependency_context(task)
             self.task_queue.remove(task_id)
             if task.required_resources:
                 self._grant_resources(
@@ -120,6 +125,7 @@ class OrchestratorState:
                 )
             task.status = "running"
             task.assigned_agent_id = agent_id
+            task.started_monotonic = self.now()
             agent.current_task_id = task.task_id
             agent.last_seen_monotonic = self.now()
             self._persist_state()
@@ -133,6 +139,7 @@ class OrchestratorState:
             raise ValueError(f"task {task_id} is not assigned to agent {agent_id}")
         task.status = "completed" if success else "failed"
         task.result = result
+        task.completed_monotonic = self.now()
         self.release_resources(agent_id, task.required_resources)
         agent.current_task_id = None
         self._persist_state()
@@ -216,9 +223,53 @@ class OrchestratorState:
             if agent:
                 agent.current_task_id = None
         task.status = "cancelled"
+        task.completed_monotonic = self.now()
         self.task_queue = deque(item for item in self.task_queue if item != task_id)
         self._persist_state()
         return task
+
+    def retry_run(self, run_id: str, *, include_completed: bool = False) -> Dict[str, Any]:
+        run_tasks = [task for task in self.tasks.values() if f"run:{run_id}" in task.labels]
+        if not run_tasks:
+            raise ValueError(f"run not found: {run_id}")
+
+        retry_ids = {
+            task.task_id for task in run_tasks
+            if include_completed or task.status in {"failed", "cancelled"}
+        }
+        changed = True
+        while changed:
+            changed = False
+            for task in run_tasks:
+                if task.task_id in retry_ids:
+                    continue
+                if any(dep_id in retry_ids for dep_id in task.dependencies):
+                    retry_ids.add(task.task_id)
+                    changed = True
+
+        reset: List[str] = []
+        for task in run_tasks:
+            if task.task_id not in retry_ids:
+                continue
+            if task.assigned_agent_id:
+                agent = self.agents.get(task.assigned_agent_id)
+                if agent and agent.current_task_id == task.task_id:
+                    agent.current_task_id = None
+                self.release_resources(task.assigned_agent_id, task.required_resources)
+            task.status = "queued"
+            task.assigned_agent_id = None
+            task.started_monotonic = None
+            task.completed_monotonic = None
+            task.result = None
+            if isinstance(task.payload, dict):
+                task.payload.pop("dependency_context_injected", None)
+                if task.payload.get("base_prompt"):
+                    task.payload["prompt"] = task.payload.pop("base_prompt")
+            self._enqueue_task(task.task_id)
+            reset.append(task.task_id)
+
+        self._persist_state()
+        return {"run_id": run_id, "reset_task_ids": reset, "reset_count": len(reset)}
 
     def resources_owned_by(self, agent_id: str) -> List[str]:
         return sorted(resource_id for resource_id, lease in self.leases.items() if lease.owner_agent_id == agent_id)
@@ -238,7 +289,30 @@ class OrchestratorState:
 
     def _build_snapshot(self) -> Dict[str, Any]:
         now = self.now()
+        task_values = list(self.tasks.values())
+        completed = [task for task in task_values if task.completed_monotonic is not None]
+        running = [task for task in task_values if task.status == "running"]
+        runnable = [task for task in task_values if task.status == "queued" and self._dependencies_satisfied(task)]
+        blocked = [task for task in task_values if task.status == "queued" and not self._dependencies_satisfied(task)]
+        total_runtime = sum(
+            (task.completed_monotonic or now) - (task.started_monotonic or now)
+            for task in completed
+        )
+        avg_runtime_ms = int((total_runtime / len(completed)) * 1000) if completed else 0
+        active_worker_count = sum(1 for agent in self.agents.values() if agent.current_task_id)
+        worker_count = len(self.agents)
         return {
+            "metrics": {
+                "agent_count": worker_count,
+                "active_agents": active_worker_count,
+                "idle_agents": max(0, worker_count - active_worker_count),
+                "queued_tasks": len(runnable),
+                "blocked_tasks": len(blocked),
+                "running_tasks": len(running),
+                "completed_tasks": sum(1 for task in task_values if task.status == "completed"),
+                "failed_tasks": sum(1 for task in task_values if task.status == "failed"),
+                "avg_runtime_ms": avg_runtime_ms,
+            },
             "agents": [
                 {
                     "agent_id": agent.agent_id,
@@ -275,17 +349,91 @@ class OrchestratorState:
                 {
                     "task_id": task.task_id,
                     "task_type": task.task_type,
-                    "status": task.status,
+                    "status": self._display_status(task),
                     "priority": task.priority,
                     "assigned_agent_id": task.assigned_agent_id,
+                    "wait_ms": int(((task.started_monotonic or now) - task.created_monotonic) * 1000),
+                    "run_ms": int(((task.completed_monotonic or now) - task.started_monotonic) * 1000) if task.started_monotonic else 0,
                     "required_capabilities": sorted(task.required_capabilities),
                     "required_resources": task.required_resources,
                     "labels": sorted(task.labels),
+                    "dependencies": task.dependencies,
+                    "blocked_by": self._blocked_by(task),
+                    "workdir": str(task.payload.get("workdir", "")) if isinstance(task.payload, dict) else "",
+                    "stage": str(task.payload.get("stage", "")) if isinstance(task.payload, dict) else "",
+                    "prompt_preview": self._prompt_preview(task.payload),
                     "result": task.result,
                 }
                 for task in sorted(self.tasks.values(), key=lambda item: item.created_monotonic)
             ],
         }
+
+    def _prompt_preview(self, payload: Dict[str, Any]) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        prompt = str(payload.get("task_brief") or payload.get("original_prompt") or payload.get("prompt") or "")
+        compact = " ".join(prompt.split())
+        return compact[:160]
+
+    def _dependencies_satisfied(self, task: TaskRecord) -> bool:
+        return all(
+            dep_id in self.tasks and self.tasks[dep_id].status == "completed"
+            for dep_id in task.dependencies
+        )
+
+    def _blocked_by(self, task: TaskRecord) -> List[str]:
+        return [
+            dep_id for dep_id in task.dependencies
+            if dep_id not in self.tasks or self.tasks[dep_id].status != "completed"
+        ]
+
+    def _display_status(self, task: TaskRecord) -> str:
+        if task.status == "queued" and not self._dependencies_satisfied(task):
+            return "blocked"
+        return task.status
+
+    def _inject_dependency_context(self, task: TaskRecord) -> None:
+        if not task.dependencies or not isinstance(task.payload, dict):
+            return
+        if task.payload.get("dependency_context_injected"):
+            return
+        base_prompt = str(task.payload.get("prompt", ""))
+        context = self._dependency_context(task)
+        if not context:
+            return
+        task.payload["base_prompt"] = base_prompt
+        task.payload["prompt"] = "\n\n".join(
+            [
+                base_prompt,
+                "UPSTREAM WORKER OUTPUTS PROVIDED BY OSAGENTD:",
+                context,
+                "Use the upstream outputs above as inputs. Do not blindly repeat them; integrate them into your role-specific work.",
+            ]
+        )
+        task.payload["dependency_context_injected"] = True
+
+    def _dependency_context(self, task: TaskRecord) -> str:
+        sections: List[str] = []
+        for dep_id in task.dependencies:
+            dep = self.tasks.get(dep_id)
+            if not dep:
+                continue
+            result = dep.result or {}
+            stage = dep.task_type
+            summary = str(result.get("summary") or "-")
+            output_tail = str(result.get("output_tail") or "").strip()
+            log_file = str(result.get("log_file") or "")
+            parts = [
+                f"[{stage} {dep.task_id[:8]}]",
+                f"status: {dep.status}",
+                f"summary: {summary}",
+            ]
+            if output_tail:
+                parts.extend(["output_tail:", output_tail])
+            if log_file:
+                parts.append(f"log_file: {log_file}")
+            sections.append("\n".join(parts))
+        return "\n\n".join(sections)
 
     def _normalize_resources(self, resources: Iterable[str]) -> List[str]:
         normalized: List[str] = []
@@ -402,4 +550,3 @@ class OrchestratorState:
         if task_id not in self.tasks:
             raise ValueError(f"unknown task_id: {task_id}")
         return self.tasks[task_id]
-

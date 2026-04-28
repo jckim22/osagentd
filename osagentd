@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+
+cmd="${1:-up}"
+shift || true
+
+case "$cmd" in
+  up|start)
+    exec python3 -m ai_develop_orchestrator.launcher --app-dir "$ROOT_DIR" --workdir "$ROOT_DIR" --attach --replace "$@"
+    ;;
+  bg)
+    exec python3 -m ai_develop_orchestrator.launcher --app-dir "$ROOT_DIR" --workdir "$ROOT_DIR" --replace "$@"
+    ;;
+  attach)
+    session="${1:-osagentd}"
+    exec tmux attach -t "$session"
+    ;;
+  down|stop|kill)
+    exec python3 -m ai_develop_orchestrator.launcher --app-dir "$ROOT_DIR" --workdir "$ROOT_DIR" --stop "$@"
+    ;;
+  status)
+    exec python3 -m ai_develop_orchestrator.cli status "$@"
+    ;;
+  results|result)
+    exec python3 -m ai_develop_orchestrator.results "$@"
+    ;;
+  runs|history)
+    exec python3 -m ai_develop_orchestrator.results --list "$@"
+    ;;
+  latest)
+    exec python3 -m ai_develop_orchestrator.results --open "$@"
+    ;;
+  doctor)
+    exec python3 -m ai_develop_orchestrator.doctor "$@"
+    ;;
+  retry)
+    exec python3 -m ai_develop_orchestrator.retry "$@"
+    ;;
+  metrics)
+    exec python3 -m ai_develop_orchestrator.metrics "$@"
+    ;;
+  ask|submit)
+    exec python3 -m ai_develop_orchestrator.submit "$@"
+    ;;
+  echo)
+    exec python3 -m ai_develop_orchestrator.launcher --app-dir "$ROOT_DIR" --workdir "$ROOT_DIR" --attach --replace --executor-mode echo "$@"
+    ;;
+  *)
+    cat <<'HELP'
+osagentd - OS-native multi-agent development console
+
+Usage:
+  ./osagentd up       Start the full tmux UI and attach
+  ./osagentd bg       Start the UI in background
+  ./osagentd attach   Attach to the running tmux UI
+  ./osagentd down     Stop daemon, monitor, submitter, autoscaler, workers
+  ./osagentd status   Print daemon status JSON
+  ./osagentd results  Show latest run result, logs, and produced files
+  ./osagentd runs     List recent runs
+  ./osagentd latest   Print latest FINAL.md path
+  ./osagentd doctor   Check tmux, codex, daemon, session, latest result
+  ./osagentd retry    Retry failed tasks in the latest run
+  ./osagentd metrics  Show runtime, token, and parallelism metrics
+  ./osagentd ask "..." Submit a task without opening the tmux UI
+  ./osagentd echo     Start demo mode without spending Codex calls
+
+Pass launcher options after the command:
+  ./osagentd up --max-workers 6 --monitor-width 45
+HELP
+    exit 2
+    ;;
+esac

@@ -105,6 +105,7 @@ class OrchestratorServer:
                     required_resources=request.get("required_resources", []),
                     lease_ttl_ms=int(request.get("lease_ttl_ms", 10000)),
                     labels=request.get("labels", []),
+                    dependencies=request.get("dependencies", []),
                 )
                 return ok(task_id=task.task_id, status=task.status)
             if action == "poll_task":
@@ -136,6 +137,12 @@ class OrchestratorServer:
             if action == "cancel_task":
                 task = self.state.cancel_task(str(request["task_id"]))
                 return ok(task_id=task.task_id, status=task.status)
+            if action == "retry_run":
+                result = self.state.retry_run(
+                    str(request["run_id"]),
+                    include_completed=bool(request.get("include_completed", False)),
+                )
+                return ok(**result)
             if action == "acquire":
                 result = self.state.acquire_resources(
                     agent_id=str(request["agent_id"]),
@@ -196,4 +203,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
